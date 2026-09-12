@@ -1,3 +1,3 @@
-module github.com/simplesys/local-llm-runner
+module github.com/simplesys/locallm
 
 go 1.27.0

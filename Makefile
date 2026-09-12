@@ -1,4 +1,4 @@
-BINARY  := local-llm-runner
+BINARY  := locallm
 PKG     := ./cmd/$(BINARY)
 BIN_DIR := bin
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -17,6 +17,12 @@ help: ## Show available targets
 build: ## Build the binary into bin/
 	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/$(BINARY) $(PKG)
 
+.PHONY: crossbuild
+crossbuild: ## Check cross-compilation for the target platforms
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o /dev/null $(PKG)
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null $(PKG)
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o /dev/null $(PKG)
+
 .PHONY: run
 run: ## Run the app, pass flags via ARGS="--model qwen"
 	go run $(PKG) $(ARGS)
@@ -24,6 +30,10 @@ run: ## Run the app, pass flags via ARGS="--model qwen"
 .PHONY: test
 test: ## Run unit tests with the race detector
 	go test -race -count=1 ./...
+
+.PHONY: test-integration
+test-integration: ## Run tests that require a running LM Studio
+	go test -tags=integration -count=1 -timeout=10m ./...
 
 .PHONY: cover
 cover: ## Run tests and print total coverage

@@ -44,4 +44,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/simplesys/local-llm-runner
+        - github.com/simplesys/locallm

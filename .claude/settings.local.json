@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(codex --help)",  
+      "Bash(grep *)",
+      "Bash(kimi --help)"
+    ],
+    "deny": [
+      ".env"
+    ]
+  }
+}

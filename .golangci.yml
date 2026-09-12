@@ -1,0 +1,47 @@
+# golangci-lint v2 configuration. Install: brew install golangci-lint
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - contextcheck
+    - errname
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+    - sloglint
+    - thelper
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    sloglint:
+      kv-only: true
+      context: scope
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/simplesys/local-llm-runner

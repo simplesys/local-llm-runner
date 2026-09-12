@@ -1,4 +1,4 @@
-# local-llm-runner
+# locallm
 
 Терминальный кодинг-агент для локальных LLM: работа с кодом в стиле Claude Code, но на моделях, запущенных на вашей машине через [LM Studio](https://lmstudio.ai).
 
@@ -14,9 +14,9 @@
 
 ```sh
 make build
-./bin/local-llm-runner --help
-./bin/local-llm-runner --model qwen2.5-coder
-./bin/local-llm-runner --task "add tests for package config"
+./bin/locallm --help
+./bin/locallm --model qwen2.5-coder
+./bin/locallm --task "add tests for package config"
 ```
 
 | Параметр | Флаг | Переменная окружения | По умолчанию |

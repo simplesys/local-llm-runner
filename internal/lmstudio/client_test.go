@@ -170,7 +170,7 @@ func TestFirstUsable(t *testing.T) {
 		wantOK bool
 	}{
 		{name: "prefers a loaded tool-capable model", models: []lmstudio.Model{coldTool, loadedTool}, want: "loaded", wantOK: true},
-		{name: "falls back to a cold tool-capable model", models: []lmstudio.Model{noTools, coldTool}, want: "cold", wantOK: true},
+		{name: "never chooses a model that is not loaded", models: []lmstudio.Model{noTools, coldTool}},
 		{name: "nothing usable", models: []lmstudio.Model{noTools}},
 		{name: "empty listing", models: nil},
 	}

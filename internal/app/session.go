@@ -149,13 +149,20 @@ type sessionRunner struct {
 
 	agent    *agent.Agent
 	recorded int
+	// stopReason is why the last task ended; it goes into the metrics file.
+	stopReason string
 	// input is the channel of the reader goroutine while an interactive
 	// session runs; it is nil in one-shot mode.
 	input <-chan inputLine
 }
 
 // newAgent builds the agent loop with the tools and limits of this session.
+// Without a selected model there is no agent yet: the user names one with
+// /model.
 func (r *sessionRunner) newAgent() error {
+	if r.model == "" {
+		return nil
+	}
 	prompt := agent.BuildSystemPrompt(agent.PromptData{
 		Workspace:    r.cfg.Workspace,
 		OS:           runtime.GOOS,
@@ -188,17 +195,15 @@ func (r *sessionRunner) newAgent() error {
 	return nil
 }
 
-// projectInstructions reads the instruction file of the project, if any.
+// projectInstructions reads the instruction file of the project, if any. The
+// file goes to the model whole: cutting it would silently leave the agent
+// working by rules the developer wrote but never sees applied.
 func (r *sessionRunner) projectInstructions() string {
-	const maxInstructions = 8 << 10
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
 		//nolint:gosec // the file name is a fixed constant inside the workspace
 		data, err := os.ReadFile(filepath.Join(r.cfg.Workspace, name))
 		if err != nil {
 			continue
-		}
-		if len(data) > maxInstructions {
-			data = append(data[:maxInstructions], []byte("\n... instructions truncated")...)
 		}
 		r.console.Notice("project instructions: %s", name)
 		return string(data)
@@ -206,16 +211,21 @@ func (r *sessionRunner) projectInstructions() string {
 	return ""
 }
 
-// handleEvent feeds one agent event to the interface and the metrics.
+// handleEvent feeds one agent event to the interface, the metrics and the
+// session log. The log is written while the task runs, not after it: a task
+// that hangs, loops or dies must still leave behind everything that happened
+// up to that moment.
 func (r *sessionRunner) handleEvent(event agent.Event) {
 	r.console.Handle(event)
 	switch event.Kind {
 	case agent.EventTurnDone:
 		r.collector.AddTurn(event.Usage.PromptTokens, event.Usage.CompletionTokens)
+		r.recordNewMessages()
 	case agent.EventToolResult:
 		r.collector.AddToolCall()
+		r.recordNewMessages()
 	case agent.EventContent, agent.EventReasoning, agent.EventToolStart, agent.EventNotice:
-		// nothing to measure
+		// nothing to measure and nothing complete to record yet
 	}
 }
 
@@ -254,9 +264,17 @@ func (r *sessionRunner) turn(ctx context.Context, input string) (agent.Outcome, 
 			r.console.Warn("%v", err)
 		}
 	}
-	r.recorded = len(r.agent.History())
+	// Run appends the user message that has just been recorded, so the
+	// cursor skips it.
+	r.recorded = len(r.agent.History()) + 1
 
 	outcome, err := r.agent.Run(ctx, input)
+	// A request that failed has no stop reason of its own: the status alone
+	// says what happened.
+	r.stopReason = ""
+	if err == nil {
+		r.stopReason = string(outcome.StopReason)
+	}
 	r.console.EndAnswer()
 	r.recordNewMessages()
 	return outcome, err
@@ -315,6 +333,7 @@ func (r *sessionRunner) report(mode, status string) {
 		Sandbox:    string(r.sandbox.Level()),
 		Mode:       mode,
 		Status:     status,
+		StopReason: r.stopReason,
 		StartedAt:  r.collector.StartedAt(),
 		FinishedAt: time.Now(),
 		Metrics:    snapshot,

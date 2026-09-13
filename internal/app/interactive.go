@@ -19,7 +19,11 @@ const doublePressWindow = 2 * time.Second
 
 // runInteractive reads user input until the user leaves or input ends.
 func (r *sessionRunner) runInteractive(ctx context.Context, opts Options) (string, error) {
-	r.console.Notice("model %s · workspace %s · sandbox %s", r.model, r.cfg.Workspace, r.sandbox.Level())
+	model := r.model
+	if model == "" {
+		model = "not selected"
+	}
+	r.console.Notice("model %s · workspace %s · sandbox %s", model, r.cfg.Workspace, r.sandbox.Level())
 	r.console.Notice("type /help for commands, /exit to quit")
 
 	input := readLines(r.console)
@@ -56,6 +60,11 @@ func (r *sessionRunner) runInteractive(ctx context.Context, opts Options) (strin
 				if quit {
 					return status, nil
 				}
+				continue
+			}
+
+			if r.agent == nil {
+				r.console.Warn("no model is selected: pick one with /model <id>")
 				continue
 			}
 
@@ -107,6 +116,10 @@ func (r *sessionRunner) runCommand(ctx context.Context, command ui.SlashCommand)
 				return false, err
 			}
 			printModels(r.console.Err, models)
+			if r.model == "" {
+				r.console.Notice("no model is selected; pick one with /model <id>")
+				return false, nil
+			}
 			r.console.Notice("current model: %s; switch with /model <id>", r.model)
 			return false, nil
 		}
@@ -138,8 +151,10 @@ func (r *sessionRunner) printHelp() {
 
 // clear forgets the conversation and starts a new session log.
 func (r *sessionRunner) clear() error {
-	r.agent.Reset()
-	r.recorded = len(r.agent.History())
+	if r.agent != nil {
+		r.agent.Reset()
+		r.recorded = len(r.agent.History())
+	}
 
 	if r.writer == nil || r.store == nil {
 		r.console.Notice("conversation cleared")
@@ -184,7 +199,13 @@ func (r *sessionRunner) switchModel(ctx context.Context, name string) error {
 	}
 
 	r.model = target
-	r.agent.SetModel(target)
+	if r.agent == nil {
+		if err := r.newAgent(); err != nil {
+			return err
+		}
+	} else {
+		r.agent.SetModel(target)
+	}
 	if r.writer != nil {
 		if err := r.writer.SetModel(target); err != nil {
 			r.console.Warn("%v", err)

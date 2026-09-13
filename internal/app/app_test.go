@@ -23,12 +23,25 @@ type fakeServer struct {
 	modelsStatus int
 	replies      []string
 	chatRequests []map[string]any
+	// beforeReply is called with the number of chat requests received so
+	// far, before the reply is written: it lets a test look at the state of
+	// the session while the task is still running.
+	beforeReply func(request int)
 }
 
 // loadedModel is a model listing with one loaded, tool-capable model.
 const loadedModel = `{"object":"list","data":[
   {"id":"qwen3","object":"model","type":"llm","state":"loaded","quantization":"Q8_0",
    "max_context_length":32768,"loaded_context_length":32768,"capabilities":["tool_use"]}
+]}`
+
+// twoLoadedModels is a listing where two conversational models occupy memory
+// at the same time.
+const twoLoadedModels = `{"object":"list","data":[
+  {"id":"qwen3","object":"model","type":"llm","state":"loaded","quantization":"Q8_0",
+   "max_context_length":32768,"loaded_context_length":32768,"capabilities":["tool_use"]},
+  {"id":"gemma","object":"model","type":"llm","state":"loaded","quantization":"Q4_K_M",
+   "max_context_length":8192,"loaded_context_length":8192,"capabilities":["tool_use"]}
 ]}`
 
 // modelWithoutTools is a listing where nothing supports tool calling.
@@ -49,6 +62,9 @@ func newFakeServer(t *testing.T, modelsBody string, replies ...string) *fakeServ
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			fake.chatRequests = append(fake.chatRequests, body)
+			if fake.beforeReply != nil {
+				fake.beforeReply(len(fake.chatRequests))
+			}
 			index := min(len(fake.chatRequests)-1, len(fake.replies)-1)
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte(fake.replies[index]))
@@ -107,6 +123,23 @@ type runResult struct {
 
 func run(t *testing.T, fake *fakeServer, input string, args ...string) runResult {
 	t.Helper()
+	return runCLI(t, fake, input, append([]string{"--no-switch"}, args...)...)
+}
+
+// runSwitching runs with model management on and with no lms executable in
+// reach, so that a session that tries to switch models fails instead of
+// touching the real LM Studio.
+func runSwitching(t *testing.T, fake *fakeServer, input string, args ...string) runResult {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("PATH", filepath.Join(home, "bin"))
+	t.Setenv("HOME", home)
+	t.Setenv("LMSTUDIO_HOME", home)
+	return runCLI(t, fake, input, args...)
+}
+
+func runCLI(t *testing.T, fake *fakeServer, input string, args ...string) runResult {
+	t.Helper()
 	configDir := filepath.Join(t.TempDir(), "config")
 	workspace := t.TempDir()
 	t.Setenv(config.EnvConfigDir, configDir)
@@ -115,7 +148,7 @@ func run(t *testing.T, fake *fakeServer, input string, args ...string) runResult
 	fullArgs := append([]string{
 		"--base-url", fake.baseURL(),
 		"--workspace", workspace,
-		"--no-switch", "--yes",
+		"--yes",
 	}, args...)
 
 	err := app.Run(t.Context(), app.Options{
@@ -201,6 +234,55 @@ func TestOneShotUsesTools(t *testing.T) {
 	}
 }
 
+// TestProjectInstructionsPassedWhole guards the rule that the instruction
+// file reaches the model as the developer wrote it, however long it is.
+func TestProjectInstructionsPassedWhole(t *testing.T) {
+	fake := newFakeServer(t, loadedModel, sseAnswer("ok"))
+	configDir := filepath.Join(t.TempDir(), "config")
+	t.Setenv(config.EnvConfigDir, configDir)
+	workspace := t.TempDir()
+	instructions := "# rules\n" +
+		strings.Repeat("cover every change with tests.\n", 1000) +
+		"the last rule: answer in the language of the user.\n"
+	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte(instructions), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+
+	var stdout, stderr strings.Builder
+	err := app.Run(t.Context(), app.Options{
+		Version: "test",
+		Args: []string{
+			"--base-url", fake.baseURL(), "--workspace", workspace,
+			"--no-switch", "--yes", "--task", "hi",
+		},
+		Getenv: func(string) string { return "" },
+		Stdin:  strings.NewReader(""),
+		Stdout: &stdout, Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v\nstderr: %s", err, stderr.String())
+	}
+	if len(fake.chatRequests) != 1 {
+		t.Fatalf("chat requests = %d, want 1", len(fake.chatRequests))
+	}
+	messages, ok := fake.chatRequests[0]["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages = %v, want the system message", fake.chatRequests[0]["messages"])
+	}
+	system, ok := messages[0].(map[string]any)
+	if !ok || system["role"] != "system" {
+		t.Fatalf("first message = %v, want the system message", messages[0])
+	}
+	prompt, _ := system["content"].(string)
+	if !strings.Contains(prompt, "the last rule: answer in the language of the user.") {
+		t.Errorf("system prompt ends with %q, want the whole instruction file", prompt[max(len(prompt)-80, 0):])
+	}
+	if strings.Contains(prompt, "truncated") {
+		t.Errorf("system prompt ends with %q, want no truncation of the instructions",
+			prompt[max(len(prompt)-80, 0):])
+	}
+}
+
 func TestListModels(t *testing.T) {
 	fake := newFakeServer(t, loadedModel)
 	result := run(t, fake, "", "--list-models")
@@ -237,6 +319,54 @@ func TestUnknownModel(t *testing.T) {
 	}
 }
 
+func TestStartupKeepsTheLoadedModel(t *testing.T) {
+	fake := newFakeServer(t, twoLoadedModels, sseAnswer("готово"))
+	result := runSwitching(t, fake, "", "--task", "hi")
+
+	if result.err != nil {
+		t.Fatalf("Run() error = %v\nstderr: %s", result.err, result.stderr)
+	}
+	if len(fake.chatRequests) != 1 {
+		t.Fatalf("chat requests = %d, want 1", len(fake.chatRequests))
+	}
+	if got := fake.chatRequests[0]["model"]; got != "qwen3" {
+		t.Errorf("model = %v, want the loaded qwen3", got)
+	}
+	if strings.Contains(result.stderr, "unloading models") {
+		t.Errorf("stderr = %q, want no model switching when no model is named", result.stderr)
+	}
+}
+
+func TestNamedModelStillSwitches(t *testing.T) {
+	fake := newFakeServer(t, twoLoadedModels, sseAnswer("never reached"))
+	result := runSwitching(t, fake, "", "--task", "hi", "--model", "qwen3")
+
+	if !errors.Is(result.err, app.ErrBackend) {
+		t.Fatalf("Run() error = %v, want ErrBackend: naming a model must switch", result.err)
+	}
+	if !strings.Contains(result.err.Error(), "--no-switch") {
+		t.Errorf("Run() error = %v, want the switching error about the missing lms", result.err)
+	}
+	if len(fake.chatRequests) != 0 {
+		t.Errorf("chat requests = %d, want none", len(fake.chatRequests))
+	}
+}
+
+func TestInteractiveWithoutLoadedModel(t *testing.T) {
+	fake := newFakeServer(t, modelWithoutTools, sseAnswer("never reached"))
+	result := run(t, fake, "hi\n/exit\n")
+
+	if result.err != nil {
+		t.Fatalf("Run() error = %v\nstderr: %s", result.err, result.stderr)
+	}
+	if len(fake.chatRequests) != 0 {
+		t.Errorf("chat requests = %d, want none without a model", len(fake.chatRequests))
+	}
+	if !strings.Contains(result.stderr, "/model <id>") {
+		t.Errorf("stderr = %q, want a hint about /model", result.stderr)
+	}
+}
+
 func TestBackendUnavailable(t *testing.T) {
 	fake := newFakeServer(t, loadedModel)
 	fake.modelsStatus = http.StatusInternalServerError
@@ -253,10 +383,29 @@ func TestBackendUnavailable(t *testing.T) {
 
 func TestLimitReached(t *testing.T) {
 	fake := newFakeServer(t, loadedModel, sseToolCall("call_1", "list_dir", `{}`))
-	result := run(t, fake, "", "--task", "list everything", "--max-turns", "1")
+	metricsDir := filepath.Join(t.TempDir(), "metrics")
+	result := run(t, fake, "", "--task", "list everything", "--max-turns", "1", "--metrics-dir", metricsDir)
 
 	if !errors.Is(result.err, app.ErrLimit) {
 		t.Fatalf("Run() error = %v, want ErrLimit", result.err)
+	}
+	entries, err := os.ReadDir(metricsDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("metrics files = %v, error = %v, want one file", entries, err)
+	}
+	data, err := os.ReadFile(filepath.Join(metricsDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read metrics file: %v", err)
+	}
+	var file struct {
+		Status     string `json:"status"`
+		StopReason string `json:"stop_reason"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatalf("decode metrics file: %v", err)
+	}
+	if file.Status != "limit" || file.StopReason != "max_turns" {
+		t.Errorf("metrics file = %+v, want the limit status and the budget that stopped the task", file)
 	}
 }
 
@@ -280,11 +429,12 @@ func TestMetricsFile(t *testing.T) {
 		t.Fatalf("read metrics file: %v", err)
 	}
 	var file struct {
-		SessionID string `json:"session_id"`
-		Model     string `json:"model"`
-		Mode      string `json:"mode"`
-		Status    string `json:"status"`
-		Metrics   struct {
+		SessionID  string `json:"session_id"`
+		Model      string `json:"model"`
+		Mode       string `json:"mode"`
+		Status     string `json:"status"`
+		StopReason string `json:"stop_reason"`
+		Metrics    struct {
 			Turns       int `json:"turns"`
 			TotalTokens int `json:"total_tokens"`
 		} `json:"metrics"`
@@ -292,8 +442,8 @@ func TestMetricsFile(t *testing.T) {
 	if err := json.Unmarshal(data, &file); err != nil {
 		t.Fatalf("decode metrics file: %v", err)
 	}
-	if file.Model != "qwen3" || file.Mode != "one-shot" || file.Status != "ok" {
-		t.Errorf("metrics file = %+v, want the model, mode and status recorded", file)
+	if file.Model != "qwen3" || file.Mode != "one-shot" || file.Status != "ok" || file.StopReason != "done" {
+		t.Errorf("metrics file = %+v, want the model, mode, status and stop reason recorded", file)
 	}
 	if file.SessionID == "" || file.Metrics.Turns != 1 || file.Metrics.TotalTokens != 120 {
 		t.Errorf("metrics file = %+v, want the session id and the counters", file)
@@ -330,6 +480,81 @@ func TestSessionRecorded(t *testing.T) {
 			t.Errorf("session log = %s\nwant it to contain %q", text, want)
 		}
 	}
+	if got := strings.Count(text, `"role":"user"`); got != 1 {
+		t.Errorf("user messages in the log = %d, want 1:\n%s", got, text)
+	}
+}
+
+// TestSessionLogWrittenDuringTask pins the behavior that matters when a task
+// hangs, loops or dies: what the model has already done is in the log before
+// the task ends, not only after it.
+func TestSessionLogWrittenDuringTask(t *testing.T) {
+	fake := newFakeServer(t, loadedModel,
+		sseToolCall("call_1", "read_file", `{"path":"go.mod"}`),
+		sseAnswer("the module is example"),
+	)
+	configDir := filepath.Join(t.TempDir(), "config")
+	t.Setenv(config.EnvConfigDir, configDir)
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module example\n"), 0o644); err != nil {
+		t.Fatalf("write workspace file: %v", err)
+	}
+
+	var duringTask string
+	fake.beforeReply = func(request int) {
+		if request == 2 {
+			duringTask = readSessionLog(t, configDir)
+		}
+	}
+
+	var stdout, stderr strings.Builder
+	err := app.Run(t.Context(), app.Options{
+		Version: "test",
+		Args: []string{
+			"--base-url", fake.baseURL(), "--workspace", workspace,
+			"--no-switch", "--yes", "--task", "read go.mod",
+		},
+		Getenv: func(string) string { return "" },
+		Stdin:  strings.NewReader(""),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v\nstderr: %s", err, stderr.String())
+	}
+
+	for _, want := range []string{"read go.mod", "read_file", `"type":"tool_result"`, "module example"} {
+		if !strings.Contains(duringTask, want) {
+			t.Errorf("session log during the task = %s\nwant it to contain %q", duringTask, want)
+		}
+	}
+	if strings.Contains(duringTask, "the module is example") {
+		t.Errorf("session log during the task = %s\nwant no answer that the model has not given yet", duringTask)
+	}
+}
+
+// readSessionLog returns the only session log in the configuration directory.
+func readSessionLog(t *testing.T, configDir string) string {
+	t.Helper()
+	dir := filepath.Join(configDir, "sessions")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read session directory: %v", err)
+	}
+	var logs []string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".jsonl") {
+			logs = append(logs, entry.Name())
+		}
+	}
+	if len(logs) != 1 {
+		t.Fatalf("session logs = %v, want one", logs)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, logs[0]))
+	if err != nil {
+		t.Fatalf("read session log: %v", err)
+	}
+	return string(data)
 }
 
 func TestNoSessionFlag(t *testing.T) {

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
-	"strings"
 
 	"github.com/simplesys/locallm/internal/config"
 	"github.com/simplesys/locallm/internal/lmstudio"
@@ -30,7 +28,10 @@ func printModels(w io.Writer, models []lmstudio.Model) {
 	}
 }
 
-// chooseModel decides which model the session runs on.
+// chooseModel decides which model the session runs on. A named model is
+// taken as it is; otherwise the session keeps the model the server already
+// has in memory. An empty result means that no model is selected yet and the
+// user has to name one with /model.
 func chooseModel(cfg config.Config, models []lmstudio.Model, console *ui.Console) (string, error) {
 	if cfg.Model != "" {
 		for _, model := range models {
@@ -45,60 +46,24 @@ func chooseModel(cfg config.Config, models []lmstudio.Model, console *ui.Console
 	}
 
 	if model, ok := lmstudio.FirstUsable(models); ok {
-		console.Notice("model %s selected automatically", model.ID)
+		console.Notice("model %s is loaded, working with it", model.ID)
 		return model.ID, nil
 	}
 	if !cfg.Interactive() {
-		return "", fmt.Errorf("%w: no model with tool support is available: load one in LM Studio or pass --model", ErrBackend)
+		return "", fmt.Errorf("%w: no model with tool support is loaded: load one in LM Studio or pass --model", ErrBackend)
 	}
-	return askForModel(models, console)
+	console.Warn("no model with tool support is loaded: load one in LM Studio or pick one with /model <id>")
+	return "", nil
 }
 
-// askForModel lets the user pick a model from the listing.
-func askForModel(models []lmstudio.Model, console *ui.Console) (string, error) {
-	choices := make([]lmstudio.Model, 0, len(models))
-	for _, model := range models {
-		if model.Chattable() {
-			choices = append(choices, model)
-		}
-	}
-	if len(choices) == 0 {
-		return "", fmt.Errorf("%w: the server reports no conversational models", ErrBackend)
-	}
-
-	console.Notice("no model with tool support is loaded, pick one:")
-	for index, model := range choices {
-		tools := ""
-		if !model.SupportsTools() {
-			tools = " (no tool support)"
-		}
-		console.Notice("  %d) %s%s", index+1, model.ID, tools)
-	}
-
-	for range 3 {
-		console.ShowPrompt()
-		answer, ok, err := console.ReadLine()
-		if err != nil {
-			return "", err
-		}
-		if !ok {
-			return "", errors.New("no model selected")
-		}
-		number, convErr := strconv.Atoi(strings.TrimSpace(answer))
-		if convErr == nil && number >= 1 && number <= len(choices) {
-			return choices[number-1].ID, nil
-		}
-		console.Warn("enter a number between 1 and %d", len(choices))
-	}
-	return "", errors.New("no model selected")
-}
-
-// ensureLoaded makes the chosen model the only one in memory. It returns the
-// lock that must be held for the rest of the session.
+// ensureLoaded makes the chosen model the only one in memory. It acts only
+// when the user named a model: a session that runs on whatever the server
+// already has in memory never loads or unloads anything. It returns the lock
+// that must be held for the rest of the session.
 func ensureLoaded(ctx context.Context, cfg config.Config, api *lmstudio.Client, models []lmstudio.Model,
 	model string, console *ui.Console,
 ) (*lmstudio.Lock, error) {
-	if cfg.NoSwitch {
+	if cfg.NoSwitch || cfg.Model == "" {
 		return nil, nil
 	}
 	alreadyAlone := onlyModelLoaded(models, model)

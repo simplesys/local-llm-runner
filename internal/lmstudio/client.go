@@ -92,16 +92,12 @@ func (c *Client) Models(ctx context.Context) ([]Model, error) {
 }
 
 // FirstUsable returns the model to work with when the user did not name one:
-// a loaded model that supports tools, otherwise any model that supports
-// tools. It reports false when nothing fits.
+// the first loaded model that supports tools. A model that is not loaded is
+// never chosen: loading one is the user's decision. It reports false when
+// nothing fits.
 func FirstUsable(models []Model) (Model, bool) {
 	for _, m := range models {
 		if m.Chattable() && m.Loaded() && m.SupportsTools() {
-			return m, true
-		}
-	}
-	for _, m := range models {
-		if m.Chattable() && m.SupportsTools() {
 			return m, true
 		}
 	}
